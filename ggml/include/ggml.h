@@ -429,7 +429,8 @@ extern "C" {
         GGML_TYPE_MXFP4   = 39, // MXFP4 (1 block)
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0    = 41,
-        GGML_TYPE_COUNT   = 42,
+        GGML_TYPE_Q8_0_2_4 = 42, // 2:4 structured-sparse INT8 (qwen-compress extension)
+        GGML_TYPE_COUNT   = 43,
     };
 
     // precision

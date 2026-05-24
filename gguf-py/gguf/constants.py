@@ -24,6 +24,7 @@ class Keys:
         QUANTIZATION_VERSION       = "general.quantization_version"
         ALIGNMENT                  = "general.alignment"
         FILE_TYPE                  = "general.file_type"
+        SPARSITY_LAYOUT            = "general.sparsity_layout"  # "2:4" / "4:8" / unset (qwen-compress extension)
 
         # Recommended Sampler Parameters
         SAMPLING_SEQUENCE           = "general.sampling.sequence"
@@ -4141,7 +4142,8 @@ class GGMLQuantizationType(IntEnum):
     TQ2_0   = 35
     MXFP4   = 39
     NVFP4   = 40
-    Q1_0    = 41
+    Q1_0     = 41
+    Q8_0_2_4 = 42   # 2:4 structured sparse + INT8 (qwen-compress extension)
 
 
 class ExpertGatingFuncType(IntEnum):
@@ -4312,6 +4314,7 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     GGMLQuantizationType.IQ1_M:   (256, QK_K // 8 + QK_K // 16  + QK_K // 32),
     GGMLQuantizationType.BF16:    (1, 2),
     GGMLQuantizationType.TQ1_0:   (256, 2 + 4 * 13),
+    GGMLQuantizationType.Q8_0_2_4: (32, 2 + 16 + 8),   # scale + 16 int8 values + 8 bytes of 2-bit indices
     GGMLQuantizationType.TQ2_0:   (256, 2 + 64),
     GGMLQuantizationType.MXFP4:   (32, 1 + 16),
     GGMLQuantizationType.NVFP4:   (64, 4 + 32),

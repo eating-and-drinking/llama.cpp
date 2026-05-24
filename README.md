@@ -1,4 +1,50 @@
-# llama.cpp
+# llama.cpp (Fork — 二次开发版本)
+
+> **⚠️ 这是一个 fork / 二次开发版本，不是官方 llama.cpp。**
+>
+> This repository is a personal **fork** of [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp).
+> 它在上游 llama.cpp 的基础上做了二次开发，专门用于配合 [qwen-compress](https://github.com/) 项目，
+> 在 CPU 端运行 **2:4 结构化稀疏 + INT8** 量化的 Qwen 模型。
+>
+> 上游的全部功能、模型支持、构建系统、CLI、server 等均保留，使用方式与官方 llama.cpp 完全一致。
+
+---
+
+## 🔧 Fork Notice — 本 fork 的修改内容
+
+本仓库在上游 [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) 之上，新增了以下内容（其他文件均与上游保持一致）：
+
+| 新增内容 | 位置 | 说明 |
+|---|---|---|
+| `GGML_TYPE_Q8_0_2_4` | `ggml/include/ggml.h` | 新增的量化类型枚举值 `42`，表示 2:4 结构化稀疏 INT8（每 32 个元素 26 字节） |
+| 稀疏 INT8 内核 | `ggml/src/ggml-cpu/sparse_24.c` | CPU 端 vec_dot 实现，编译期 SIMD 派发：AVX-512 (BW+VL+VBMI[+VNNI]) → AVX2 (PSHUFB gather) → AArch64 NEON ([+DOTPROD]) → scalar fallback |
+| 头文件 | `ggml/src/ggml-cpu/sparse_24.h` | 量化 / 反量化 / vec_dot 接口声明 |
+| 单元测试 | `tests/test-sparse-24.c` | 数值精度与 SIMD 一致性测试 |
+
+**关键技术点：**
+
+- **2:4 结构化稀疏**：每 4 个连续权重中只保留 2 个非零值，配合 4-bit 索引存储，相比 dense INT8 节省 ~37.5% 内存带宽。
+- **编译期 SIMD 派发**：通过 `#if defined(__AVX512VBMI__) / __AVX2__ / __aarch64__` 等宏选择最优指令集，没有运行时分支开销。
+- **VNNI / DOTPROD 加速**：在支持 `VPDPBUSD` (Intel) 或 `SDOT` (ARMv8.4-A) 的硬件上自动使用单指令 i8 点积，吞吐量进一步提升。
+- **与 qwen-compress 配套**：上游导出的 GGUF 文件由 `qwen-compress` 生成（包含通道置换 + 硬强制 2:4 + 校准量化），本 fork 负责在 CPU 端高效推理。
+
+**与上游的兼容性：**
+
+- 所有上游模型与量化类型（Q4_K_M、Q8_0、F16 等）继续工作，行为不变。
+- 仅当模型张量被标记为 `GGML_TYPE_Q8_0_2_4` 时，才走本 fork 的稀疏 kernel；其他张量走上游路径。
+- 本 fork 不修改任何上游公共 API，可与上游 master 周期性 rebase。
+
+**Base commit:** 本 fork 当前基于上游 commit `95405ac65` (vulkan: fix windows find_package of SPIRV-Headers, #23215)。
+
+**License:** 仍为 MIT，与上游一致。新增代码同样以 MIT 协议发布。
+
+**作者声明：** 本 fork 由我个人在上游 llama.cpp 基础上完成二次开发，原始 llama.cpp 的全部版权与贡献归 [@ggerganov](https://github.com/ggerganov) 及 [ggml-org](https://github.com/ggml-org) 所有。本人仅对新增的 `sparse_24.*`、`test-sparse-24.c` 以及 `ggml.h` 中的 enum 行负责。
+
+---
+
+> 下方为上游 llama.cpp 原始 README，未作修改。
+
+---
 
 ![llama](https://user-images.githubusercontent.com/1991296/230134379-7181e485-c521-4d23-a0d6-f7b3b61ba524.png)
 

@@ -726,6 +726,15 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = (ggml_to_float_t) dequantize_row_q8_0,
         .from_float_ref           = (ggml_from_float_t) quantize_row_q8_0_ref,
     },
+    [GGML_TYPE_Q8_0_2_4] = {
+        .type_name                = "q8_0_2_4",
+        .blck_size                = 32,          // QK8_0_2_4
+        .type_size                = 26,          // sizeof(block_q8_0_2_4): 2 + 16 + 8
+        .is_quantized             = true,
+        // to_float / from_float_ref intentionally NULL: only the CPU vec_dot
+        // path uses this type. Generic conversion goes via dequantize on the
+        // CPU side via type_traits_cpu (sparse_24.c).
+    },
     [GGML_TYPE_Q8_1] = {
         .type_name                = "q8_1",
         .blck_size                = QK8_1,
