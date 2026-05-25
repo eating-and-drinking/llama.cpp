@@ -731,9 +731,25 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .blck_size                = 32,          // QK8_0_2_4
         .type_size                = 26,          // sizeof(block_q8_0_2_4): 2 + 16 + 8
         .is_quantized             = true,
-        // to_float / from_float_ref intentionally NULL: only the CPU vec_dot
-        // path uses this type. Generic conversion goes via dequantize on the
-        // CPU side via type_traits_cpu (sparse_24.c).
+        // to_float / from_float_ref intentionally NULL.
+        //
+        // Architecturally: dequantize_row_q8_0_2_4 lives in ggml-cpu/sparse_24.c,
+        // which is in libggml-cpu (a downstream library that links AGAINST
+        // ggml-base). ggml.c is in ggml-base — it cannot reference symbols
+        // from libggml-cpu without breaking the link of shared-library builds
+        // (-Wl,--no-undefined fails with an undefined reference).
+        //
+        // Practical impact: any code path that calls
+        //   ggml_get_type_traits(GGML_TYPE_Q8_0_2_4)->to_float(...)
+        // unguarded will null-deref. Today this affects ggml_dup / ggml_cpy
+        // from a Q8_0_2_4 tensor and a few related ops in ggml-cpu/ops.cpp.
+        // The intended use case (weight-only in mul_mat via .vec_dot) does
+        // not hit these. Flash-attention's V path GGML_ASSERTs loudly if you
+        // try to use Q8_0_2_4 there, which is the correct behaviour.
+        //
+        // Proper fix (if/when needed): move block_q8_0_2_4 to ggml-common.h
+        // and the dequantize impl into ggml-quants.c (both in ggml-base),
+        // then register the pointer here.
     },
     [GGML_TYPE_Q8_1] = {
         .type_name                = "q8_1",

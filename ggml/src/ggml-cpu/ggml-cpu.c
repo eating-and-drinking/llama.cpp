@@ -270,6 +270,21 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .nrows                    = 1,
 #endif
     },
+    [GGML_TYPE_Q8_0_2_4] = {
+        // 2:4 structured-sparse INT8. Weights are pre-packed offline by the
+        // qwen-compress tool, so no .from_float is provided (this type is
+        // weight-only). Activations come in as standard block_q8_0.
+        //
+        // nrows = 1: ggml's mul_mat dispatcher uses .nrows = 2 to mean a
+        // *2x2 output tile* (2 weight rows AND 2 activation columns; the
+        // kernel must compute 4 products, see the ARM i8mm Q8_0 path for the
+        // pattern). Our sparse kernel only implements the single-row case
+        // (asserts nrc == 1), so enabling nrows = 2 would produce wrong
+        // results — keep this at 1.
+        .vec_dot                  = ggml_vec_dot_q8_0_2_4_q8_0,
+        .vec_dot_type             = GGML_TYPE_Q8_0,
+        .nrows                    = 1,
+    },
     [GGML_TYPE_Q8_1] = {
         .from_float               = quantize_row_q8_1,
         .vec_dot_type             = GGML_TYPE_Q8_1,

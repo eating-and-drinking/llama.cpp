@@ -30,7 +30,7 @@ typedef struct {
     uint8_t idx[8];
 } block_q8_0_2_4;
 
-_Static_assert(sizeof(block_q8_0_2_4) == 26, "wrong block_q8_0_2_4 size");
+static_assert(sizeof(block_q8_0_2_4) == 26, "wrong block_q8_0_2_4 size");
 
 // Scalar reference (correctness baseline). Used on platforms without SIMD
 // implementations and as the testing oracle.
@@ -47,9 +47,15 @@ void ggml_vec_dot_q8_0_2_4_q8_0_ref(
 
 // SIMD-optimised vec_dot. Compile-time dispatch picks (in order):
 //   * AVX-512 (BW+VL+VBMI, Ice Lake+)        — 2 blocks/iter via VPERMB
-//   * AVX2 (Haswell+ / Excavator+)           — 1 block/iter via PSHUFB
+//   * AVX2 (Haswell+ / Excavator+)           — 2 blocks/iter via PSHUFB
+//                                              (lane-local gather + OR-trick;
+//                                               software prefetch lookahead)
 //   * AArch64 NEON (Apple Silicon, ARMv8)    — 1 block/iter via VQTBL2Q
 //   * otherwise                              — delegates to the scalar reference.
+//
+// All paths require nrc == 1. The dispatcher's nrc==2 path (a 2x2 output tile,
+// see the ARM i8mm Q8_0 reference) is not implemented for this type — the
+// type_traits_cpu entry sets .nrows = 1 so ggml never asks for it.
 void ggml_vec_dot_q8_0_2_4_q8_0(
     int n, float * GGML_RESTRICT s, size_t bs,
     const void * GGML_RESTRICT vx, size_t bx,

@@ -5474,6 +5474,36 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
                 VALIDATE_ROW_DATA_D_F16_IMPL(block_iq4_nl, data, nb);
             } break;
 
+        case GGML_TYPE_Q8_0_2_4:
+            {
+                // block_q8_0_2_4 = 26 bytes: 2-byte FP16 d, 16 int8 qs, 8 idx bytes.
+                // The struct is declared in ggml-cpu/sparse_24.h (not pulled into
+                // ggml-base to avoid the cross-DSO dep that would force ggml-base
+                // to link against ggml-cpu); we validate via raw byte offsets.
+                const uint8_t * blocks = (const uint8_t *) data;
+                for (size_t i = 0; i < nb; ++i) {
+                    const uint8_t * block = blocks + i * 26;
+                    ggml_fp16_t d;
+                    memcpy(&d, block, sizeof(d));
+                    if (!validate_fp16(d, i)) {
+                        return false;
+                    }
+                    // 2:4 invariant: in each of 8 idx bytes, both nibbles
+                    // must be in 0..3 AND be distinct (a group keeps 2 of 4).
+                    const uint8_t * idx = block + 2 + 16;
+                    for (int g = 0; g < 8; ++g) {
+                        const uint8_t b = idx[g];
+                        const uint8_t p1 = (b >> 4) & 0xf;
+                        const uint8_t p2 = b & 0xf;
+                        if (p1 > 3 || p2 > 3 || p1 == p2) {
+                            fprintf(stderr, "%s: invalid 2:4 idx byte 0x%02x at q8_0_2_4 block %zu group %d\n",
+                                    __func__, b, i, g);
+                            return false;
+                        }
+                    }
+                }
+            } break;
+
         case GGML_TYPE_I8:
         case GGML_TYPE_I16:
         case GGML_TYPE_I32:

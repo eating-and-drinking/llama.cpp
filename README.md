@@ -20,6 +20,11 @@
 | 稀疏 INT8 内核 | `ggml/src/ggml-cpu/sparse_24.c` | CPU 端 vec_dot 实现，编译期 SIMD 派发：AVX-512 (BW+VL+VBMI[+VNNI]) → AVX2 (PSHUFB gather) → AArch64 NEON ([+DOTPROD]) → scalar fallback |
 | 头文件 | `ggml/src/ggml-cpu/sparse_24.h` | 量化 / 反量化 / vec_dot 接口声明 |
 | 单元测试 | `tests/test-sparse-24.c` | 数值精度与 SIMD 一致性测试 |
+| 全局 type traits | `ggml/src/ggml.c` | 注册 `type_traits[GGML_TYPE_Q8_0_2_4]`:`blck_size=32, type_size=26`;`to_float`/`from_float_ref` 故意留 NULL(见下文 sharp edges) |
+| CPU type traits | `ggml/src/ggml-cpu/ggml-cpu.c` | 注册 `type_traits_cpu[GGML_TYPE_Q8_0_2_4]`:`.vec_dot = ggml_vec_dot_q8_0_2_4_q8_0, .vec_dot_type = GGML_TYPE_Q8_0, .nrows = 1` |
+| GGUF 加载校验 | `ggml/src/ggml-quants.c` | 扩展 `ggml_validate_row_data`:检 FP16 d 的 NaN/Inf 和每个 idx 字节的 2:4 不变式(p1 != p2),避免 `--check-tensors` 加载失败 |
+| 构建集成 | `ggml/src/ggml-cpu/CMakeLists.txt` | 把 `sparse_24.{c,h}` 加入 `GGML_CPU_SOURCES` |
+| GGUF 转换器 | `tools/convert_qwen_sparse/` | Python 工具:把 HF safetensors 格式的已 2:4-sparse 权重打包成包含 `Q8_0_2_4` 张量的 GGUF |
 
 **关键技术点：**
 
@@ -37,6 +42,17 @@
 **Base commit:** 本 fork 当前基于上游 commit `95405ac65` (vulkan: fix windows find_package of SPIRV-Headers, #23215)。
 
 **License:** 仍为 MIT，与上游一致。新增代码同样以 MIT 协议发布。
+
+**性能(i9-9880H, AVX2, DDR4-2667):** 在 DRAM-bound 工况下(大模型权重 » L3),稀疏 kernel 比 dense Q8_0 快 ~5%(median over 7 runs),加上 23.5% 的 RAM 节省。在 L1/L3 工况下 dense 更快(稀疏 gather 有开销);实际推理往往是 DRAM-bound 的情况居多。
+
+**已知限制 / Sharp Edges:**
+
+- `GGML_TYPE_Q8_0_2_4` 是 **weight-only** 类型:`ggml.c` 里 `to_float` 和 `from_float_ref` 故意为 NULL。
+  - `ggml_quantize_chunk(GGML_TYPE_Q8_0_2_4, ...)` 会 `assert(false)`(需离线用 `tools/convert_qwen_sparse/` packing)。
+  - `ggml_dup` / `ggml_cpy` / `ggml_get_rows` 等非-mul_mat 路径对我们的张量会 null-deref。标准 weight-in-mul_mat workflow 不触发;transformer 推理中只有 attention/FFN 的 linear 层是稀疏的,`tools/convert_qwen_sparse/` 也只把这些层存成 Q8_0_2_4(embed / lm_head / norm 全保持 dense)。
+  - 如果以后有需求彻底修复,需把 `block_q8_0_2_4` 结构移到 `ggml-common.h`、把 `dequantize_row_q8_0_2_4` 移到 `ggml-quants.c`,然后注册 `.to_float`。
+- AVX-512 / NEON 路径已曾编译验证,但尚未在真机上跑过 microbenchmark。AVX2 路径在 i9-9880H 上验证过 bit-identical 与 scalar reference。
+
 
 **作者声明：** 本 fork 由我个人在上游 llama.cpp 基础上完成二次开发，原始 llama.cpp 的全部版权与贡献归 [@ggerganov](https://github.com/ggerganov) 及 [ggml-org](https://github.com/ggml-org) 所有。本人仅对新增的 `sparse_24.*`、`test-sparse-24.c` 以及 `ggml.h` 中的 enum 行负责。
 

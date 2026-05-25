@@ -37,6 +37,22 @@
 // Pull in dense Q8_0 block definition (we only use the layout, not its kernel).
 #include "ggml-common.h"
 
+// Portable 64-byte-aligned allocator.
+//   * MSVC has no aligned_alloc; use _aligned_malloc / _aligned_free.
+//   * Standard aligned_alloc requires `size` to be a multiple of alignment
+//     (C11 §7.22.3.1); round up to satisfy that.
+#define SPARSE24_ALIGN 64
+static inline size_t sparse24_round_up(size_t n, size_t a) {
+    return (n + a - 1) & ~(a - 1);
+}
+#if defined(_MSC_VER)
+    #define SPARSE24_ALLOC(sz) _aligned_malloc(sparse24_round_up((sz), SPARSE24_ALIGN), SPARSE24_ALIGN)
+    #define SPARSE24_FREE(p)   _aligned_free(p)
+#else
+    #define SPARSE24_ALLOC(sz) aligned_alloc(SPARSE24_ALIGN, sparse24_round_up((sz), SPARSE24_ALIGN))
+    #define SPARSE24_FREE(p)   free(p)
+#endif
+
 // -----------------------------------------------------------------------------
 // Tiny RNG (xorshift32) for repeatability
 // -----------------------------------------------------------------------------
@@ -180,8 +196,8 @@ static int test_correctness(int n) {
 
     // Quantize
     int nb = n / QK8_0_2_4;
-    block_q8_0_2_4 * wq = aligned_alloc(64, nb * sizeof(block_q8_0_2_4));
-    block_q8_0     * aq = aligned_alloc(64, nb * sizeof(block_q8_0));
+    block_q8_0_2_4 * wq = SPARSE24_ALLOC(nb * sizeof(block_q8_0_2_4));
+    block_q8_0     * aq = SPARSE24_ALLOC(nb * sizeof(block_q8_0));
     if (pack_row_q8_0_2_4(w, n, wq) < 0) { return 1; }
     if (pack_row_q8_0    (a, n, aq) < 0) { return 1; }
 
@@ -202,7 +218,7 @@ static int test_correctness(int n) {
     if (diff_simd > 1e-3f)      { printf("  FAIL: AVX2 path disagrees with scalar\n"); failed = 1; }
     if (!failed) printf("  PASS\n");
 
-    free(w); free(a); free(wq); free(aq);
+    free(w); free(a); SPARSE24_FREE(wq); SPARSE24_FREE(aq);
     return failed;
 }
 
@@ -213,7 +229,7 @@ static int test_dequantize(int n) {
     gen_random_24_row(w, n);
 
     int nb = n / QK8_0_2_4;
-    block_q8_0_2_4 * wq = aligned_alloc(64, nb * sizeof(block_q8_0_2_4));
+    block_q8_0_2_4 * wq = SPARSE24_ALLOC(nb * sizeof(block_q8_0_2_4));
     pack_row_q8_0_2_4(w, n, wq);
 
     float * w_back = malloc(n * sizeof(float));
@@ -235,7 +251,7 @@ static int test_dequantize(int n) {
     int failed = (zero_mismatch != 0) || (max_err > 0.05f);
     printf("  %s\n", failed ? "FAIL" : "PASS");
 
-    free(w); free(wq); free(w_back);
+    free(w); SPARSE24_FREE(wq); free(w_back);
     return failed;
 }
 
@@ -248,8 +264,8 @@ static int benchmark(int n, int iters) {
     for (int i = 0; i < n; ++i) a[i] = frand();
 
     int nb = n / QK8_0_2_4;
-    block_q8_0_2_4 * wq_sparse = aligned_alloc(64, nb * sizeof(block_q8_0_2_4));
-    block_q8_0     * aq        = aligned_alloc(64, nb * sizeof(block_q8_0));
+    block_q8_0_2_4 * wq_sparse = SPARSE24_ALLOC(nb * sizeof(block_q8_0_2_4));
+    block_q8_0     * aq        = SPARSE24_ALLOC(nb * sizeof(block_q8_0));
     pack_row_q8_0_2_4(w, n, wq_sparse);
     pack_row_q8_0    (a, n, aq);
 
@@ -270,7 +286,7 @@ static int benchmark(int n, int iters) {
            ns_per_iter, (nb * sizeof(block_q8_0_2_4)) / ns_per_iter);
     printf("  (sanity: result = %.4f)\n", s);
 
-    free(w); free(a); free(wq_sparse); free(aq);
+    free(w); free(a); SPARSE24_FREE(wq_sparse); SPARSE24_FREE(aq);
     return 0;
 }
 
@@ -287,5 +303,24 @@ int main(void) {
     printf("\n[OK] all sparse_24 tests passed.\n");
     return 0;
 }
-;
+ vec_dot: %.1f ns/iter, %.2f GB/s effective\n",
+           ns_per_iter, (nb * sizeof(block_q8_0_2_4)) / ns_per_iter);
+    printf("  (sanity: result = %.4f)\n", s);
+
+    free(w); free(a); SPARSE24_FREE(wq_sparse); SPARSE24_FREE(aq);
+    return 0;
+}
+
+int main(void) {
+    int failed = 0;
+    failed |= test_correctness(32);     // single block
+    failed |= test_correctness(2048);   // larger row
+    failed |= test_correctness(11008);  // qwen2.5-3b intermediate dim
+    failed |= test_dequantize(32);
+    failed |= test_dequantize(2048);
+    benchmark(11008, 100000);
+
+    if (failed) { printf("\n[FAIL] one or more tests failed.\n"); return 1; }
+    printf("\n[OK] all sparse_24 tests passed.\n");
+    return 0;
 }

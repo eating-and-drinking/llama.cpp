@@ -87,6 +87,9 @@ void ggml_vec_dot_q8_0_2_4_q8_0_ref(
             const uint8_t idx_byte = x[b].idx[g];
             const int p1 = (idx_byte >> 4) & 0x3;
             const int p2 = (idx_byte     ) & 0x3;
+            // 2:4 invariant: the two kept positions in a group must be distinct.
+            // Asserted in debug builds; release builds trust the packer.
+            assert(p1 != p2);
             const int base = g * 4;
             acc_i += (int32_t)x[b].qs[kept]     * (int32_t)y[b].qs[base + p1];
             acc_i += (int32_t)x[b].qs[kept + 1] * (int32_t)y[b].qs[base + p2];
@@ -114,6 +117,9 @@ void dequantize_row_q8_0_2_4(
             const uint8_t idx_byte = x[b].idx[g];
             const int p1 = (idx_byte >> 4) & 0x3;
             const int p2 = (idx_byte     ) & 0x3;
+            // 2:4 invariant: the two kept positions in a group must be distinct.
+            // Asserted in debug builds; release builds trust the packer.
+            assert(p1 != p2);
             const int base = g * 4;
             yb[base + p1] = (float)x[b].qs[kept]     * d;
             yb[base + p2] = (float)x[b].qs[kept + 1] * d;
@@ -135,6 +141,30 @@ static inline float sparse24_hsum_ps_256(const __m256 x) {
     res = _mm_add_ps(res, _mm_movehl_ps(res, res));
     res = _mm_add_ss(res, _mm_movehdup_ps(res));
     return _mm_cvtss_f32(res);
+}
+
+// SIMD construction of the 16 absolute gather indices for one block.
+//   Input  : 8 packed bytes, each = (p1 << 4) | p2 with p1, p2 in 0..3.
+//   Output : 16 bytes in [0..31], pattern [g*4+p1, g*4+p2] for g = 0..7.
+// Cost: 4 cheap intrinsics; replaces a scalar loop of 16 byte stores.
+static inline __m128i sparse24_build_block_idx(const uint8_t * GGML_RESTRICT idx) {
+    const __m128i base = _mm_setr_epi8(
+        0, 0, 4, 4, 8, 8, 12, 12, 16, 16, 20, 20, 24, 24, 28, 28);
+    // Mask to 0..3 (the valid range of a 2:4 position), matching the scalar
+    // reference's `(idx_byte >> 4) & 0x3` / `idx_byte & 0x3`. Equivalent to 0x0F
+    // on well-formed inputs (high nibble is always 0..3); 0x03 makes us bit-
+    // identical to scalar on malformed inputs as well.
+    const __m128i nibble_mask = _mm_set1_epi8(0x03);
+
+    // Load 8 idx bytes into the low 64 bits; upper 64 bits zeroed.
+    const __m128i idx8 = _mm_loadl_epi64((const __m128i *) idx);
+    // Shift each 16-bit lane right by 4, then mask to 0x03:
+    const __m128i hi = _mm_and_si128(_mm_srli_epi16(idx8, 4), nibble_mask);
+    // Low nibble masked to 0x03 (top 2 bits of each nibble discarded).
+    const __m128i lo = _mm_and_si128(idx8, nibble_mask);
+    // Interleave: result byte 2g = hi[g] (= p1), byte 2g+1 = lo[g] (= p2).
+    const __m128i interleaved = _mm_unpacklo_epi8(hi, lo);
+    return _mm_add_epi8(interleaved, base);
 }
 
 void ggml_vec_dot_q8_0_2_4_q8_0(
@@ -170,31 +200,18 @@ void ggml_vec_dot_q8_0_2_4_q8_0(
         const __m256i a1  = _mm256_loadu_si256((const __m256i *) y[b+1].qs);
         const __m512i ak  = _mm512_inserti64x4(_mm512_castsi256_si512(a0), a1, 1);
 
-        // 32 absolute gather indices: lower 16 in 0..31 (block b),
-        // upper 16 in 32..63 (block b+1).
-        uint8_t abs_idx[32];
-        for (int g = 0; g < 8; ++g) {
-            const uint8_t bi = x[b].idx[g];
-            abs_idx[g * 2    ] = (uint8_t)(g * 4 + ((bi >> 4) & 0x3));
-            abs_idx[g * 2 + 1] = (uint8_t)(g * 4 + ((bi     ) & 0x3));
-        }
-        for (int g = 0; g < 8; ++g) {
-            const uint8_t bi = x[b+1].idx[g];
-            abs_idx[16 + g * 2    ] = (uint8_t)(32 + g * 4 + ((bi >> 4) & 0x3));
-            abs_idx[16 + g * 2 + 1] = (uint8_t)(32 + g * 4 + ((bi     ) & 0x3));
-        }
-        const __m256i idx_ymm = _mm256_loadu_si256((const __m256i *) abs_idx);
+        // 32 absolute gather indices, built entirely in SIMD.
+        const __m128i idx_b  = sparse24_build_block_idx(x[b].idx);
+        const __m128i idx_b1 = _mm_add_epi8(sparse24_build_block_idx(x[b+1].idx),
+                                            _mm_set1_epi8(32));
+        const __m256i idx_ymm = _mm256_set_m128i(idx_b1, idx_b);
         const __m512i idx_zmm = _mm512_castsi256_si512(idx_ymm);
 
         // Cross-lane byte permute (VPERMB / AVX512VBMI).
         const __m512i sel_zmm = _mm512_permutexvar_epi8(idx_zmm, ak);
         const __m256i aq      = _mm512_castsi512_si256(sel_zmm);
 
-        // Signed INT8 dot product. Flip-trick:
-        //   ax = |wq|              (0..127, treated as unsigned)
-        //   sy = sign(wq) * aq      (-127..127, signed)
-        // VPDPBUSD computes  s32 += sum_{k=0..3} ax_u[4i+k] * sy_s[4i+k]
-        // per i32 lane in one instruction.
+        // Flip-trick + VPDPBUSD (or MADDUBS+MADD fallback).
         const __m256i ax = _mm256_sign_epi8(wq, wq);
         const __m256i sy = _mm256_sign_epi8(aq, wq);
 #if defined(__AVX512VNNI__)
@@ -224,18 +241,16 @@ void ggml_vec_dot_q8_0_2_4_q8_0(
 
 
 // =========================================================================
-// Fast-path: AVX2  -- 1 block per iteration via PSHUFB gather
+// Fast-path: AVX2  -- 2 blocks per iteration via lane-local PSHUFB gather
 // =========================================================================
+//
+// Each 128-bit AVX2 lane gathers its own block's activations using PSHUFB
+// (PSHUFB is per-lane only on AVX2, so cross-lane VPERMB isn't available).
+// We pack two blocks side by side and run the dot-product across both halves
+// of the 256-bit accumulator, exactly doubling throughput vs the old
+// 1-block/iter path.
 
 #elif defined(__AVX2__)
-
-static inline __m128i mul_sum_i8_pairs_128(__m128i x, __m128i y) {
-    const __m128i ax = _mm_sign_epi8(x, x);
-    const __m128i sy = _mm_sign_epi8(y, x);
-    const __m128i dot = _mm_maddubs_epi16(ax, sy);
-    const __m128i ones = _mm_set1_epi16(1);
-    return _mm_madd_epi16(ones, dot);
-}
 
 static inline float sparse24_hsum_ps_256(const __m256 x) {
     __m128 res = _mm256_extractf128_ps(x, 1);
@@ -245,15 +260,30 @@ static inline float sparse24_hsum_ps_256(const __m256 x) {
     return _mm_cvtss_f32(res);
 }
 
-static inline void sparse24_build_gather_avx2(const uint8_t * GGML_RESTRICT idx,
-                                              int8_t * GGML_RESTRICT out_abs_idx) {
-    for (int g = 0; g < 8; ++g) {
-        const uint8_t b = idx[g];
-        const int p1 = (b >> 4) & 0x3;
-        const int p2 = (b     ) & 0x3;
-        out_abs_idx[g * 2    ] = (int8_t)(g * 4 + p1);
-        out_abs_idx[g * 2 + 1] = (int8_t)(g * 4 + p2);
-    }
+// Per-block index builder, shared with AVX-512 in spirit (separate compile
+// unit each side of the #if/#elif). See the AVX-512 path for the algorithm.
+static inline __m128i sparse24_build_block_idx_avx2(const uint8_t * GGML_RESTRICT idx) {
+    const __m128i base = _mm_setr_epi8(
+        0, 0, 4, 4, 8, 8, 12, 12, 16, 16, 20, 20, 24, 24, 28, 28);
+    // Mask to 0..3 (the valid range of a 2:4 position), matching the scalar
+    // reference's `(idx_byte >> 4) & 0x3` / `idx_byte & 0x3`. Equivalent to 0x0F
+    // on well-formed inputs (high nibble is always 0..3); 0x03 makes us bit-
+    // identical to scalar on malformed inputs as well.
+    const __m128i nibble_mask = _mm_set1_epi8(0x03);
+    const __m128i idx8 = _mm_loadl_epi64((const __m128i *) idx);
+    const __m128i hi = _mm_and_si128(_mm_srli_epi16(idx8, 4), nibble_mask);
+    const __m128i lo = _mm_and_si128(idx8, nibble_mask);
+    return _mm_add_epi8(_mm_unpacklo_epi8(hi, lo), base);
+}
+
+// 256-bit signed i8 dot product packed into 8 int32 lanes.
+// Same flip-trick as AVX-512: ax = |x|, sy = sign(x)*y.
+static inline __m256i sparse24_mul_sum_i8_pairs_256(__m256i x, __m256i y) {
+    const __m256i ax = _mm256_sign_epi8(x, x);
+    const __m256i sy = _mm256_sign_epi8(y, x);
+    const __m256i dot = _mm256_maddubs_epi16(ax, sy);
+    const __m256i ones = _mm256_set1_epi16(1);
+    return _mm256_madd_epi16(ones, dot);
 }
 
 void ggml_vec_dot_q8_0_2_4_q8_0(
@@ -271,35 +301,84 @@ void ggml_vec_dot_q8_0_2_4_q8_0(
     const int nb = n / QK8_0_2_4;
     __m256 acc = _mm256_setzero_ps();
 
-    for (int b = 0; b < nb; ++b) {
-        const __m256 d = _mm256_set1_ps(
-            GGML_CPU_FP16_TO_FP32(x[b].d) * GGML_CPU_FP16_TO_FP32(y[b].d));
+    // Hoisted constants for the OR-trick gather. PSHUFB clears any output byte
+    // whose index has bit 7 set, so we precondition the indices so that:
+    //   sel_lo = PSHUFB(a_lo, idx + 112)   - idx in 0..15 stays in 0x70..0x7F
+    //                                        (bit 7 clear -> gathers byte from a_lo);
+    //                                        idx in 16..31 becomes >=128
+    //                                        (bit 7 set -> PSHUFB zeros it).
+    //   sel_hi = PSHUFB(a_hi, idx - 16)    - idx in 16..31 becomes 0..15
+    //                                        (gathers byte from a_hi);
+    //                                        idx in 0..15 underflows to 0xF0..0xFF
+    //                                        (bit 7 set -> PSHUFB zeros it).
+    //   aq    = sel_lo | sel_hi            - exactly one is non-zero per lane.
+    //
+    // This replaces { cmpgt, and, andnot, sub, pshufb*2, blendv } = 7 ops
+    // with         { add,  sub, pshufb*2, or }                    = 5 ops,
+    // and eliminates the high-latency port-5-only blendv_epi8.
+    const __m256i v112 = _mm256_set1_epi8(112);
+    const __m256i v16  = _mm256_set1_epi8(16);
 
-        const __m128i wq = _mm_loadu_si128((const __m128i *) x[b].qs);
-        const __m128i a_lo = _mm_loadu_si128((const __m128i *)  y[b].qs);
-        const __m128i a_hi = _mm_loadu_si128((const __m128i *) (y[b].qs + 16));
+    // Lookahead distance (in blocks) for software prefetch. PF=32 blocks
+    // ahead == ~832 B of weight (13 cache lines) and ~1088 B of activation
+    // (17 lines) — far enough that the line is in L1 by the time we need it
+    // on a DDR4-2667 system (~200-cycle DRAM, ~2 cycles/iter at peak), and
+    // close enough that we don't pollute L1 with lines we won't reach.
+    // _MM_HINT_T0 targets L1d (-> all higher caches as a side effect).
+    const int PF = 32;
 
-        int8_t abs_idx[16];
-        sparse24_build_gather_avx2(x[b].idx, abs_idx);
-        const __m128i idx_vec = _mm_loadu_si128((const __m128i *) abs_idx);
+    int b = 0;
+    for (; b + 1 < nb; b += 2) {
+        if (b + PF < nb) {
+            _mm_prefetch((const char *) &x[b + PF], _MM_HINT_T0);
+            _mm_prefetch((const char *) &y[b + PF], _MM_HINT_T0);
+        }
+        const float d0 = GGML_CPU_FP16_TO_FP32(x[b].d)   * GGML_CPU_FP16_TO_FP32(y[b].d);
+        const float d1 = GGML_CPU_FP16_TO_FP32(x[b+1].d) * GGML_CPU_FP16_TO_FP32(y[b+1].d);
 
-        const __m128i v16    = _mm_set1_epi8(16);
-        const __m128i is_lo  = _mm_cmplt_epi8(idx_vec, v16);
-        const __m128i idx_l  = _mm_and_si128(idx_vec, is_lo);
-        const __m128i idx_h  = _mm_andnot_si128(is_lo, _mm_sub_epi8(idx_vec, v16));
+        // Weights: 16 bytes from each block -> __m256i (block b low, b+1 high)
+        const __m128i w0 = _mm_loadu_si128((const __m128i *) x[b].qs);
+        const __m128i w1 = _mm_loadu_si128((const __m128i *) x[b+1].qs);
+        const __m256i wq = _mm256_set_m128i(w1, w0);
 
-        const __m128i sel_l  = _mm_shuffle_epi8(a_lo, idx_l);
-        const __m128i sel_h  = _mm_shuffle_epi8(a_hi, idx_h);
-        const __m128i aq     = _mm_blendv_epi8(sel_h, sel_l, is_lo);
+        // Activations: each block's 32 bytes split into per-lane lo/hi halves.
+        // (Tried VPERM2I128 deinterleave, but on this uarch it's slower than
+        // 4 movdqu + 2 vinserti128 -- non-aligned 256-bit loads + VPERM2I128's
+        // higher latency on Zen / AVX2-era cores tip the balance the other way.)
+        const __m128i a0_lo = _mm_loadu_si128((const __m128i *)  y[b].qs);
+        const __m128i a0_hi = _mm_loadu_si128((const __m128i *) (y[b].qs + 16));
+        const __m128i a1_lo = _mm_loadu_si128((const __m128i *)  y[b+1].qs);
+        const __m128i a1_hi = _mm_loadu_si128((const __m128i *) (y[b+1].qs + 16));
+        const __m256i a_lo  = _mm256_set_m128i(a1_lo, a0_lo);
+        const __m256i a_hi  = _mm256_set_m128i(a1_hi, a0_hi);
 
-        const __m128i sum_i32_128 = mul_sum_i8_pairs_128(wq, aq);
-        const __m256i sum_i32_256 = _mm256_zextsi128_si256(sum_i32_128);
-        const __m256  sum_f       = _mm256_cvtepi32_ps(sum_i32_256);
+        // Indices in 0..31, per-lane addressing (each lane handles its block).
+        const __m128i idx_b  = sparse24_build_block_idx_avx2(x[b].idx);
+        const __m128i idx_b1 = sparse24_build_block_idx_avx2(x[b+1].idx);
+        const __m256i idx_vec = _mm256_set_m128i(idx_b1, idx_b);
 
-        acc = _mm256_fmadd_ps(d, sum_f, acc);
+        // Lane-local PSHUFB gather via OR-trick (see comment above the loop).
+        const __m256i sel_l = _mm256_shuffle_epi8(a_lo, _mm256_add_epi8(idx_vec, v112));
+        const __m256i sel_h = _mm256_shuffle_epi8(a_hi, _mm256_sub_epi8(idx_vec, v16));
+        const __m256i aq    = _mm256_or_si256(sel_l, sel_h);
+
+        // Dot product: full 256-bit, 8 int32 lanes (lanes 0..3 = b, 4..7 = b+1).
+        const __m256i s32   = sparse24_mul_sum_i8_pairs_256(wq, aq);
+        const __m256  d_v   = _mm256_set_ps(d1, d1, d1, d1, d0, d0, d0, d0);
+        const __m256  sum_f = _mm256_cvtepi32_ps(s32);
+        acc = _mm256_fmadd_ps(d_v, sum_f, acc);
     }
 
-    *s = sparse24_hsum_ps_256(acc);
+    float result = sparse24_hsum_ps_256(acc);
+
+    // Tail: 0 or 1 block remaining -- delegate to scalar reference.
+    for (; b < nb; ++b) {
+        float tail = 0.0f;
+        ggml_vec_dot_q8_0_2_4_q8_0_ref(QK8_0_2_4, &tail, 0, x + b, 0, y + b, 0, 1);
+        result += tail;
+    }
+
+    *s = result;
 }
 
 
