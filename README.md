@@ -3,7 +3,7 @@
 > **⚠️ 这是一个 fork / 二次开发版本，不是官方 llama.cpp。**
 >
 > This repository is a personal **fork** of [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp).
-> 它在上游 llama.cpp 的基础上做了二次开发，专门用于配合 [qwen-compress](https://github.com/) 项目，
+> 它在上游 llama.cpp 的基础上做了二次开发，专门用于配合 [qwen-compress](https://github.com/qwen-compress) 项目，
 > 在 CPU 端运行 **2:4 结构化稀疏 + INT8** 量化的 Qwen 模型。
 >
 > 上游的全部功能、模型支持、构建系统、CLI、server 等均保留，使用方式与官方 llama.cpp 完全一致。
